@@ -1,0 +1,79 @@
+name: Uptime
+
+on:
+  schedule:
+    - cron: '*/10 * * * *'
+  workflow_dispatch:
+
+permissions:
+  issues: write
+  actions: write
+
+concurrency:
+  group: uptime
+  cancel-in-progress: false
+
+jobs:
+  check:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    env:
+      GH_TOKEN: ${{ github.token }}
+      GH_REPO: ${{ github.repository }}
+    steps:
+      - name: Check production endpoints
+        id: probe
+        run: |
+          down=""
+          names=""
+          check() {
+            local name="$1" url="$2" code=000
+            # Four tries over ~80s so a deploy restart is not reported as an outage.
+            for attempt in 1 2 3 4; do
+              code=$(curl -s -o /dev/null -w '%{http_code}' --max-time 20 "$url" || true)
+              if [ "$code" = 200 ]; then echo "UP    $name"; return; fi
+              sleep 20
+            done
+            echo "DOWN  $name ($url answered $code)"
+            names="${names:+$names, }$name"
+            if [ "$code" = 000 ]; then
+              down="${down}- **${name}**: ${url} did not answer (timeout, DNS or TLS error)"$'\n'
+            else
+              down="${down}- **${name}**: ${url} answered HTTP ${code}"$'\n'
+            fi
+          }
+          check "API" "https://api.inaiy.com/health/ready"
+          check "Web app" "https://app.inaiy.com/"
+          check "Website" "https://inaiy.com/"
+          check "Auth" "https://auth.pennaiappz.com/health"
+          check "Super Admin" "https://superadmin.pennaiappz.com/"
+          {
+            echo "names=$names"
+            echo "down<<EOF_DOWN"
+            printf '%s' "$down"
+            echo "EOF_DOWN"
+          } >> "$GITHUB_OUTPUT"
+
+      - name: Open or close the outage issue
+        env:
+          DOWN: ${{ steps.probe.outputs.down }}
+          NAMES: ${{ steps.probe.outputs.names }}
+        run: |
+          open=$(gh issue list --label outage --state open --json number --jq '.[0].number // empty')
+          now=$(date -u '+%Y-%m-%d %H:%M UTC')
+          if [ -n "$NAMES" ]; then
+            if [ -z "$open" ]; then
+              gh label create outage --color B60205 --description "Production endpoint down" 2>/dev/null || true
+              printf 'Detected at %s by the uptime check.\n\n%s\nThis issue closes itself once every endpoint answers again.\n' "$now" "$DOWN" > body.md
+              gh issue create --title "Production down: $NAMES" --label outage --body-file body.md
+            fi
+          elif [ -n "$open" ]; then
+            gh issue close "$open" --comment "Recovered at $now. Every endpoint answers 200 again."
+          fi
+
+      - name: Keep the schedule alive
+        run: |
+          # GitHub pauses schedules in repos with no activity for 60 days.
+          if [ "$(date -u +%H)" = "00" ] && [ "$(date -u +%-M)" -lt 10 ]; then
+            gh api -X PUT "repos/$GH_REPO/actions/workflows/uptime.yml/enable" && echo "schedule refreshed"
+          fi
